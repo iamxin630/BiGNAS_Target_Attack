@@ -1,0 +1,1 @@
+python search.py --T-max=10 --conv-lr=0.01 --descent-step=30 --dropout=0.8 --hpo-lr=0.001 --lr=0.001 --meta-hidden-dim=16 --meta-interval=20 --meta-op=sage --num-layers=2 --weight-decay=0.001 --device cuda:0 --categories CD Clothing --target Clothing --use-source --use-meta --top_k=70 --user_attack_ratio 0.01 --attack_strategy='unrelated'
