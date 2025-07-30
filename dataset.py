@@ -149,11 +149,6 @@ class CrossDomain(Dataset):
         target_df["item"] = target_df["item"].apply(lambda x: target_item_index[x])
         target_df["item"] += len(user_index)
 
-        # ✅ 補上 target_asin2id / target_id2asin（加入在此處！）
-        target_asins = list(target_item_index.keys())
-        target_ids   = list(target_item_index.values())
-        id_offset = len(user_index)
-        
         target_label = torch.tensor(target_df["click"].values, dtype=torch.float)
         target_link = torch.tensor(
             target_df[["user", "item"]].values, dtype=torch.long
@@ -222,19 +217,7 @@ class CrossDomain(Dataset):
             target_train_edge_index=target_train_edge_index,
             target_valid_edge_index=target_valid_edge_index,
             target_test_edge_index=target_test_edge_index,
-            
-            target_asin2id = {asin: idx + id_offset for asin, idx in zip(target_asins, target_ids)},
-            target_id2asin = {idx + id_offset: asin for asin, idx in zip(target_asins, target_ids)},
-            
         )
-
-        # ✅ 補上：將 target_id2asin 存成 CSV 檔案
-        asin_csv_path = os.path.join(self.processed_dir, "target_id2asin.csv")
-        with open(asin_csv_path, "w", encoding="utf-8") as f:
-            f.write("global_item_id,asin\n")
-            for global_id, asin in data.target_id2asin.items():
-                f.write(f"{global_id},{asin}\n")
-        logging.info(f"[INFO] ✅ target_id2asin.csv saved at: {asin_csv_path}")
 
 
         data_list = [data]
