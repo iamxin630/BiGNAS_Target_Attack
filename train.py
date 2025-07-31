@@ -178,7 +178,7 @@ def evaluate_er_hit_ratio(
     return er_ratio
 
 
-def find_cold_items_by_frequency(data, target_train_edge_index, target_test_edge_index, freq_threshold=1):
+def find_cold_items_by_frequency(data, target_train_edge_index, target_test_edge_index, freq_threshold=0):
     num_users = data.num_users
     num_items = data.num_target_items
 
@@ -202,7 +202,8 @@ def find_cold_items_by_frequency(data, target_train_edge_index, target_test_edge
     cold_items_train = set((item_freq < freq_threshold).nonzero(as_tuple=False).view(-1).tolist())
     test_items = set((target_test_edge_index[1] - num_users).tolist())
 
-    cold_items = [2286]#list(cold_items_train & test_items)
+
+    cold_items = [2286]#list(cold_items_train & test_items) 
     logging.info(f"Found {len(cold_items)} cold items by frequency threshold {freq_threshold}")
     
     # # 🔽 統計出現次數
@@ -210,7 +211,6 @@ def find_cold_items_by_frequency(data, target_train_edge_index, target_test_edge
     # print("ASIN:", data.target_id2asin.get(cold_items, "N/A"))
 
     return cold_items
-
 
 
 # def select_high_score_fake_edges(
@@ -426,23 +426,21 @@ def train(model, perceptor, data, args):
     criterion = nn.BCELoss(reduction="none")
     iteration = 0
 
-    # Step1: 預訓練1epochs
-    pretrain_epochs = 1
-    logging.info(f"Pretraining {pretrain_epochs} epochs without fake edges")
-
-    for epoch in range(pretrain_epochs):
-        for (source_link, source_label_batch), (target_link, target_label_batch) in zip(source_train_loader, target_train_loader):
-            # torch.cuda.empty_cache()  # 可適當減少呼叫頻率
-            source_link = source_link.to(device)
+    ##### Step 1: FULL Training WITHOUT fake edges #####
+    logging.info(f"=== Step 1: Full training WITHOUT fake edges for {args.epochs} epochs ===")
+    for epoch in range(args.epochs):
+        model.train()
+        for (source_link_batch, source_label_batch), (target_link_batch, target_label_batch) in zip(source_train_loader, target_train_loader):
+            source_link_batch = source_link_batch.to(device)
             source_label_batch = source_label_batch.to(device)
-            target_link = target_link.to(device)
+            target_link_batch = target_link_batch.to(device)
             target_label_batch = target_label_batch.to(device)
-            weight_source = perceptor(source_link[1], source_edge_index, model)
+            weight_source = perceptor(source_link_batch[1], source_edge_index, model)
 
             optimizer.zero_grad()
-            source_out = model(source_edge_index, target_train_edge_index, source_link, is_source=True).view(-1)
-            target_out = model(source_edge_index, target_train_edge_index, target_link, is_source=False).view(-1)
-            source_loss = (criterion(source_out, source_label_batch).reshape(-1,1)*weight_source).sum()
+            source_out = model(source_edge_index, target_train_edge_index, source_link_batch, is_source=True).view(-1)
+            target_out = model(source_edge_index, target_train_edge_index, target_link_batch, is_source=False).view(-1)
+            source_loss = (criterion(source_out, source_label_batch).reshape(-1,1) * weight_source).sum()
             target_loss = criterion(target_out, target_label_batch).mean()
             loss = source_loss + target_loss if args.use_meta else target_loss
             loss.backward()
@@ -460,61 +458,25 @@ def train(model, perceptor, data, args):
                 except Exception as e:
                     logging.warning(f"Meta optimization failed: {e}")
 
-                try:
-                    target_meta_link, target_meta_label = next(target_meta_iter)
-                except StopIteration:
-                    target_meta_iter = iter(target_meta_loader)
-                    target_meta_link, target_meta_label = next(target_meta_iter)
-                target_meta_link = target_meta_link.to(device)
-                target_meta_label = target_meta_label.to(device)
+        train_auc = evaluate("Train", model, source_edge_index, target_train_edge_index, target_train_link, target_train_label)
+        val_auc = evaluate("Valid", model, source_edge_index, target_train_edge_index, target_valid_link, target_valid_label)
+        logging.info(f"[Epoch {epoch}] Train AUC: {train_auc:.4f}, Valid AUC: {val_auc:.4f}")
+        wandb.log({"loss": loss.item(), "train_auc": train_auc, "val_auc": val_auc}, step=epoch)
+        lr_scheduler.step()
 
-                optimizer.zero_grad()
-                target_out = model(source_edge_index, target_train_edge_index, target_meta_link, is_source=False).view(-1)
-                meta_loss = criterion(target_out, target_meta_label).mean()
+        early_stopping(val_auc, model)
+        if early_stopping.early_stop:
+            logging.info("Early stopping")
+            break
 
-                for (source_link, source_label_batch), (target_link, target_label_batch) in zip(source_meta_loader, target_meta_loader):
-                    source_link = source_link.to(device)
-                    source_label_batch = source_label_batch.to(device)
-                    target_link = target_link.to(device)
-                    target_label_batch = target_label_batch.to(device)
-                    weight_source = perceptor(source_link[1], source_edge_index, model)
-                    optimizer.zero_grad()
-                    source_out = model(source_edge_index, target_train_edge_index, source_link, is_source=True).view(-1)
-                    target_out = model(source_edge_index, target_train_edge_index, target_link, is_source=False).view(-1)
-                    source_loss = (criterion(source_out, source_label_batch).reshape(-1,1)*weight_source).sum()
-                    target_loss = criterion(target_out, target_label_batch).mean()
-                    meta_train_loss = source_loss + target_loss if args.use_meta else target_loss
-                    break
-
-                # torch.cuda.empty_cache()
-                meta_optimizer.step(
-                    train_loss=meta_train_loss,
-                    val_loss=meta_loss,
-                    aux_params=list(perceptor.parameters()),
-                    parameters=model_param,
-                    return_grads=True,
-                    entropy=None,
-                )
-
-        train_auc = evaluate("PreTrain", model, source_edge_index, target_train_edge_index, target_train_link, target_train_label)
-        val_auc = evaluate("PreValid", model, source_edge_index, target_train_edge_index, target_valid_link, target_valid_label)
-        logging.info(f"[PreTrain Epoch {epoch}] Train AUC: {train_auc:.4f}, Valid AUC: {val_auc:.4f}")
-
-    # Step 2: 找冷門商品，針對第一個做假邊攻擊及標籤擴充
+    ##### Step 2: 找冷門商品，並注入假邊 #####
     cold_items = find_cold_items_by_frequency(data, target_train_edge_index, target_test_edge_index, freq_threshold=1)
-    for item in cold_items:
-        # 計算訓練集中該商品出現次數
-        # train_count = (target_train_edge_index[1] - data.num_users == item).sum().item()
-        # 計算測試集中該商品出現次數
-        # test_count = (target_test_edge_index[1] - data.num_users == item).sum().item()
-        train_count = (target_train_edge_index[1] == item).sum()
-        test_count = (target_test_edge_index == item).sum()
-        logging.info(f"Item {item}: train count = {train_count}, test count = {test_count}")
+    logging.info(f"Cold items found: {cold_items}")
 
     target_cold_item = cold_items[0] if cold_items else None
 
     if target_cold_item is not None:
-        logging.info(f"Attacking cold item id: {target_cold_item}")
+        logging.info(f"Injecting fake edges for cold item id: {target_cold_item}")
         all_users = list(range(data.num_users))
         fake_edges = select_high_score_fake_edges(
             model, data, [target_cold_item], all_users,
@@ -524,12 +486,14 @@ def train(model, perceptor, data, args):
             user_attack_ratio=args.user_attack_ratio,
             num_fake_edges_per_item=getattr(args, "max_fake_edges_per_item", None)
         )
-        logging.info(f"Number of fake edges generated for attack: {len(fake_edges)}")
+        logging.info(f"Number of fake edges generated: {len(fake_edges)}")
+
         target_train_edge_index = inject_fake_edges(data, target_train_edge_index, fake_edges)
 
-        fake_labels = torch.ones(len(fake_edges), dtype=target_train_label.dtype)
-        target_train_label = torch.cat([target_train_label, fake_labels.to(target_train_label.device)], dim=0)
+        fake_labels = torch.ones(len(fake_edges), dtype=target_train_label.dtype).to(target_train_label.device)
+        target_train_label = torch.cat([target_train_label, fake_labels], dim=0)
 
+        # 更新 Dataset 和 DataLoader
         target_train_set = Dataset(target_train_edge_index.to("cpu"), target_train_label.to("cpu"))
         target_train_loader = DataLoader(
             target_train_set, batch_size=args.batch_size, shuffle=True,
@@ -538,30 +502,32 @@ def train(model, perceptor, data, args):
     else:
         logging.info("No cold item found for fake edge injection.")
 
-    # Step3: 假邊注入後微調剩餘輪次
-    logging.info(f"Finetuning from epoch {pretrain_epochs} to {args.epochs} with injected fake edges")
-
-    for epoch in range(pretrain_epochs, args.epochs):
-        for (source_link, source_label_batch), (target_link, target_label_batch) in zip(source_train_loader, target_train_loader):
-            # torch.cuda.empty_cache()  # 建議減少呼叫頻率
-            source_link = source_link.to(device)
+    ##### Step 3: Retrain with fake edges #####
+    logging.info(f"=== Step 3: Retraining WITH injected fake edges for {args.epochs} epochs ===")
+    iteration = 0
+    model.train()  # 確保模型在train模式
+    # （可選）若要從頭訓練，請加模型重置，這裡維持接著訓練方式保持原參數
+    for epoch in range(args.epochs):
+        for (source_link_batch, source_label_batch), (target_link_batch, target_label_batch) in zip(source_train_loader, target_train_loader):
+            source_link_batch = source_link_batch.to(device)
             source_label_batch = source_label_batch.to(device)
-            target_link = target_link.to(device)
+            target_link_batch = target_link_batch.to(device)
             target_label_batch = target_label_batch.to(device)
-            weight_source = perceptor(source_link[1], source_edge_index, model)
+            weight_source = perceptor(source_link_batch[1], source_edge_index, model)
 
             optimizer.zero_grad()
-            source_out = model(source_edge_index, target_train_edge_index, source_link, is_source=True).view(-1)
-            target_out = model(source_edge_index, target_train_edge_index, target_link, is_source=False).view(-1)
-            source_loss = (criterion(source_out, source_label_batch).reshape(-1,1)*weight_source).sum()
+            source_out = model(source_edge_index, target_train_edge_index, source_link_batch, is_source=True).view(-1)
+            target_out = model(source_edge_index, target_train_edge_index, target_link_batch, is_source=False).view(-1)
+            source_loss = (criterion(source_out, source_label_batch).reshape(-1,1) * weight_source).sum()
             target_loss = criterion(target_out, target_label_batch).mean()
             loss = source_loss + target_loss if args.use_meta else target_loss
             loss.backward()
             optimizer.step()
 
             iteration += 1
+
             if args.use_source and args.use_meta and iteration % args.meta_interval == 0:
-                logging.info(f"Meta optimization at iteration {iteration}")
+                logging.info(f"Meta optimization at iteration {iteration} (retrain)")
                 try:
                     meta_optimizeation(
                         target_meta_loader, replace_optimizer, model, args,
@@ -570,58 +536,15 @@ def train(model, perceptor, data, args):
                 except Exception as e:
                     logging.warning(f"Meta optimization failed: {e}")
 
-                try:
-                    target_meta_link, target_meta_label = next(target_meta_iter)
-                except StopIteration:
-                    target_meta_iter = iter(target_meta_loader)
-                    target_meta_link, target_meta_label = next(target_meta_iter)
+        train_auc = evaluate("Train_with_fake", model, source_edge_index, target_train_edge_index, target_train_link, target_train_label)
+        val_auc = evaluate("Valid_with_fake", model, source_edge_index, target_train_edge_index, target_valid_link, target_valid_label)
+        logging.info(f"[Epoch {epoch} retrain] Train AUC: {train_auc:.4f}, Valid AUC: {val_auc:.4f}")
+        wandb.log({"loss": loss.item(), "train_auc_with_fake": train_auc, "val_auc_with_fake": val_auc}, step=epoch)
 
-                target_meta_link = target_meta_link.to(device)
-                target_meta_label = target_meta_label.to(device)
+    ##### Step 4: 測試評估 #####
+    model = load_model(args).to(device)  # Load best模型或最後模型
 
-                optimizer.zero_grad()
-                target_out = model(source_edge_index, target_train_edge_index, target_meta_link, is_source=False).view(-1)
-                meta_loss = criterion(target_out, target_meta_label).mean()
-
-                for (source_link, source_label_batch), (target_link, target_label_batch) in zip(source_meta_loader, target_meta_loader):
-                    source_link = source_link.to(device)
-                    source_label_batch = source_label_batch.to(device)
-                    target_link = target_link.to(device)
-                    target_label_batch = target_label_batch.to(device)
-                    weight_source = perceptor(source_link[1], source_edge_index, model)
-
-                    optimizer.zero_grad()
-                    source_out = model(source_edge_index, target_train_edge_index, source_link, is_source=True).view(-1)
-                    target_out = model(source_edge_index, target_train_edge_index, target_link, is_source=False).view(-1)
-                    source_loss = (criterion(source_out, source_label_batch).reshape(-1,1)*weight_source).sum()
-                    target_loss = criterion(target_out, target_label_batch).mean()
-                    meta_train_loss = source_loss + target_loss if args.use_meta else target_loss
-                    break
-
-                # torch.cuda.empty_cache()
-                meta_optimizer.step(
-                    train_loss=meta_train_loss,
-                    val_loss=meta_loss,
-                    aux_params=list(perceptor.parameters()),
-                    parameters=model_param,
-                    return_grads=True,
-                    entropy=None,
-                )
-
-        train_auc = evaluate("Train", model, source_edge_index, target_train_edge_index, target_train_link, target_train_label)
-        val_auc = evaluate("Valid", model, source_edge_index, target_train_edge_index, target_valid_link, target_valid_label)
-        logging.info(f"[Epoch: {epoch}] Train Loss: {loss:.4f}, Train AUC: {train_auc:.4f}, Valid AUC: {val_auc:.4f}")
-        wandb.log({"loss": loss.item(), "train_auc": train_auc, "val_auc": val_auc}, step=epoch)
-
-        early_stopping(val_auc, model)
-        if early_stopping.early_stop:
-            logging.info("Early stopping")
-            break
-        lr_scheduler.step()
-
-    # Step 4: 測試評估
-    model = load_model(args).to(device)
-
+    logging.info("=== Step 4: Evaluating Hit Ratio and ER ===")
     evaluate_hit_ratio(
         model=model,
         data=data,
@@ -631,9 +554,6 @@ def train(model, perceptor, data, args):
         num_candidates=99,
         device=device,
     )
-
-
-    # Step 2 篩選冷門商品並攻擊已經做過了，這裡直接用選定的 target_cold_item 做評估
 
     if target_cold_item is not None:
         evaluate_er_hit_ratio(
@@ -649,7 +569,7 @@ def train(model, perceptor, data, args):
     else:
         logging.info("No cold item found for ER evaluation.")
 
-
     test_auc = evaluate("Test", model, source_edge_index, target_train_edge_index, target_test_link, target_test_label)
     logging.info(f"Test AUC: {test_auc:.4f}")
     wandb.log({"Test AUC": test_auc})
+
