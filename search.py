@@ -85,7 +85,7 @@ if __name__ == "__main__":
 
     # training settings
     parser.add_argument("--batch-size", type=int, default=1024)
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--patience", type=int, default=3)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--weight-decay", type=float, default=0.0)
